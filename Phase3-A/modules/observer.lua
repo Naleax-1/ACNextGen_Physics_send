@@ -544,46 +544,8 @@ local function readBridge(runtime)
             state.outputForceX = num(safeField(outputForce, "x", 0.0), 0.0)
             state.outputForceY = num(safeField(outputForce, "y", 0.0), 0.0)
             state.outputForceZ = num(safeField(outputForce, "z", 0.0), 0.0)
-            state.outputAvailable = workerOutput.worker_output_valid == true
+            state.outputAvailable = workerOutput.available == true
         end
-    end
-
-    --========================================================
-    -- Bridge body output
-    --========================================================
-
-    local body = safeField(
-        bridge,
-        "bodyForce",
-        nil
-    )
-
-    if body then
-
-        state.outputForceX =
-            num(
-                safeField(body, "x", 0.0),
-                0.0
-            )
-
-        state.outputForceY =
-            num(
-                safeField(body, "y", 0.0),
-                0.0
-            )
-
-        state.outputForceZ =
-            num(
-                safeField(body, "z", 0.0),
-                0.0
-            )
-
-        state.outputAvailable = true
-
-    else
-
-        state.outputAvailable = false
-
     end
 
     return bridge
@@ -604,7 +566,7 @@ local function readInput(runtime)
             safeField(workerOutput, "input_force", nil)
 
         state.inputValid = valid
-        state.inputAvailable = workerOutput ~= nil
+        state.inputAvailable = workerOutput.input_available == true
 
         if inputForce then
             state.inputForceX =
@@ -634,8 +596,7 @@ local function readOutput(runtime, bridge)
         state.outputValid =
             safeField(workerOutput, "worker_output_valid", false) == true
 
-        state.outputAvailable =
-            state.outputValid
+        state.outputAvailable = workerOutput.available == true
 
         local outputForce =
             safeField(workerOutput, "output_force", nil)
@@ -688,162 +649,30 @@ end
 -- Worker heartbeat / stale detection
 --============================================================
 
-local function updateHeartbeat(dt)
-    local tickChanged =
-        state.workerTick ~= state.previousWorkerTick
-
-    if tickChanged then
-
-        state.lastWorkerTickTime =
-            state.time
-
-        state.previousWorkerTick =
-            state.workerTick
-
-        state.stale = false
-        state.staleTime = 0.0
-        state.staleReason = ""
-
-    else
-
-        state.staleTime =
-            state.time -
-            state.lastWorkerTickTime
-
-        if state.staleTime >
-            CONFIG.staleTimeout then
-
-            state.stale = true
-
-            if state.workerAlive then
-
-                state.staleReason =
-                    "WORKER HEARTBEAT STALE"
-
-            else
-
-                state.staleReason =
-                    "WORKER NOT ALIVE"
-
-            end
-        end
-    end
-
-    -- Worker alive is only trusted when the heartbeat
-    -- is actually fresh.
-    if state.workerAlive and state.stale then
-        state.workerAlive = false
-    end
-end
-
---============================================================
--- Error processing
---============================================================
-
-local function updateErrors()
-    local bridgeError =
-        tostring(state.workerError or "")
-
-    if bridgeError ~= "" then
-
-        if state.lastError ~= bridgeError then
-            addError(bridgeError)
-        end
-    end
-end
-
---============================================================
--- Verification
---============================================================
-
-local function verify()
+-- Read the validator's verdict; the Observer never independently grants PASS.
+local function verify(runtime)
+    local output = getWorkerOutput(runtime)
     local v = state.verification
-
-    -- Worker Alive.
-    v.worker =
-        state.workerAlive == true
-
-    -- Tick.
-    v.tick =
-        state.workerTick > 0
-
-    -- Input.
-    v.input =
-        state.inputAvailable == true
-
-    -- Output.
-    v.output =
-        state.outputAvailable == true
-
-    -- Transfer.
-    v.transfer =
-        state.transferCount > 0
-
-    -- Errors.
-    v.errors =
-        state.errorCount == 0
-
-    -- Stale.
-    v.stale =
-        state.stale == false
-
-    -- Injection.
-    --
-    -- Phase 3-A does not require injection to be active.
-    -- The important verification is that the state is
-    -- explicitly observable.
-    v.injection =
-        state.injectionEnabled == false
-
-    -- Applied.
-    --
-    -- Applied is considered valid if the counter is
-    -- observable. In Phase 3-A zero is an expected value
-    -- because injection is normally disabled.
-    v.applied =
-        state.appliedCount >= 0
-
-    -- Overall verification.
-    --
-    -- IMPORTANT:
-    -- Injection is intentionally excluded from the
-    -- success condition because Phase 3-A is a
-    -- verification stage, not an injection stage.
-    v.overall =
-        v.worker
-        and v.tick
-        and v.input
-        and v.output
-        and v.transfer
-        and v.errors
-        and v.stale
-        and v.injection
-        and v.applied
-
-    if v.overall then
-        state.status = "PHASE_3A_PASS"
-
-    elseif state.stale then
-        state.status = "PHASE_3A_STALE"
-
-    elseif not v.worker then
-        state.status = "PHASE_3A_WORKER_WAIT"
-
-    elseif not v.input then
-        state.status = "PHASE_3A_INPUT_WAIT"
-
-    elseif not v.output then
-        state.status = "PHASE_3A_OUTPUT_WAIT"
-
-    elseif not v.transfer then
-        state.status = "PHASE_3A_TRANSFER_WAIT"
-
-    elseif not v.errors then
-        state.status = "PHASE_3A_ERROR"
-
-    else
-        state.status = "PHASE_3A_VERIFYING"
-    end
+    local checks = output and output.checks or {}
+    v.worker = output ~= nil and output.worker_alive == true
+    v.tick = output ~= nil and output.tick_fresh == true
+    v.input = output ~= nil and output.worker_input_valid == true
+    v.output = output ~= nil and output.worker_output_valid == true
+    v.transfer = output ~= nil and output.transfer_count > 0
+    v.errors = output ~= nil and output.error_count == 0
+    v.stale = output ~= nil and output.stale == false
+    v.injection = checks.injection_safe == true
+    v.applied = output ~= nil and output.injection.applied == 0
+    v.overall = output ~= nil and output.valid == true
+    state.status = output and output.status or "PHASE_3A_OUTPUT_WAIT"
+    state.errorCount = output and output.error_count or 0
+    state.lastError = output and output.failure or ""
+    state.stale = not output or output.stale
+    state.staleTime = output and output.stale_time or 0
+    state.staleReason = state.stale and "RESULT OR HEARTBEAT NOT FRESH" or ""
+    state.bodyAvailable = output ~= nil and output.body_available == true
+    state.wheelOutput = output and output.values and output.values.wheel or nil
+    state.pendingSequence = output and output.pending_sequence or 0
 end
 
 --============================================================
@@ -911,19 +740,19 @@ function M.update(dt, car, runtime)
     -- Heartbeat
     --========================================================
 
-    updateHeartbeat(dt)
+    -- Freshness comes from WorkerOutput, not this throttled UI clock.
 
     --========================================================
     -- Errors
     --========================================================
 
-    updateErrors()
+    -- Errors are retained by the validator, not reset or recounted here.
 
     --========================================================
     -- Verification
     --========================================================
 
-    verify()
+    verify(runtime)
 
     --========================================================
     -- Diagnostic logging
@@ -1045,7 +874,7 @@ function M.drawUI(runtime, modules)
 
     ui.text(
         "Overall          : " ..
-        passWait(v.overall)
+        passWait(v.overall) .. " (transport only; AC behavior unverified)"
     )
 
     ui.separator()
@@ -1070,7 +899,7 @@ function M.drawUI(runtime, modules)
 
     ui.text(
         " Tick Fresh       : " ..
-        yesNo(not state.stale)
+        yesNo(v.tick)
     )
 
     ui.text(
@@ -1115,7 +944,7 @@ function M.drawUI(runtime, modules)
 
     ui.text(
         string.format(
-            " Input Force      : %.3f / %.3f / %.3f",
+            state.bodyAvailable and " Input Body Force : %.3f / %.3f / %.3f" or " Input Body Force : N/A (no producer)",
             state.inputForceX,
             state.inputForceY,
             state.inputForceZ
@@ -1149,7 +978,7 @@ function M.drawUI(runtime, modules)
 
     ui.text(
         string.format(
-            " Output Force     : %.3f / %.3f / %.3f",
+            state.bodyAvailable and " Output Body Force: %.3f / %.3f / %.3f" or " Output Body Force: N/A (no producer)",
             state.outputForceX,
             state.outputForceY,
             state.outputForceZ
@@ -1161,6 +990,16 @@ function M.drawUI(runtime, modules)
         tostring(state.outputSequence)
     )
 
+    ui.separator()
+
+    ui.text(" Input/Output sequence above: last acknowledged pair")
+    ui.text(" Pending Sequence : " .. tostring(state.pendingSequence or 0))
+    ui.text(" Worker wheel results (unchanged producer channels)")
+    for i, name in ipairs({"FL", "FR", "RL", "RR"}) do
+        local w = state.wheelOutput and state.wheelOutput[i - 1]
+        ui.text(w and string.format(" %s lateral %.3f / longitudinal %.3f", name,
+            w.lateralForce, w.longitudinalForce) or (" " .. name .. " : N/A"))
+    end
     ui.separator()
 
     --========================================================
@@ -1331,7 +1170,7 @@ function M.drawUI(runtime, modules)
 
     ui.text(
         "PHASE 3-A RESULT : " ..
-        passWait(v.overall)
+        passWait(v.overall) .. " (transport only; AC behavior unverified)"
     )
 
     --========================================================
