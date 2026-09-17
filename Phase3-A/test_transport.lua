@@ -24,6 +24,12 @@ local function fixture()
         tyreRadius=0.33, tyreWidth=0.22, isInContact=true} end
     f.env = setmetatable({}, {__index=_G})
     f.env._G = f.env
+    -- Each mocked CSP context has its own global environment, including
+    -- dynamically compiled chunks (as separate real CSP Lua states do).
+    f.env.loadstring = function(source)
+        local chunk, err = loadstring(source)
+        return chunk and setfenv(chunk, f.env), err
+    end
     local ac = {
         StructItem = { key=function(k) return k end, int32=function() return 'int' end,
             double=function() return 'double' end, float=function() return 'float' end },
@@ -119,7 +125,7 @@ test('asynchronous previous-input response is paired before next publish',functi
     local f=fixture(); f:ready()
     equal(f.output.state.input_sequence,1); equal(f.output.state.output_sequence,1)
     equal(f.output.state.pending_sequence,2); equal(f.output.state.transfer_count,1)
-    assert(f.observer.state.verification.overall)
+    assert(f.observer.getState().verification.overall)
 end)
 test('returned wheel channels preserve all four independently',function()
     local f=fixture(); f:ready()
@@ -221,8 +227,8 @@ test('worker callback error remains visible',function()
 end)
 test('unexpected Applied is observed, not hidden by a hardcoded zero',function()
     local f=fixture(); f:ready(); f.shared.appliedCount=1; f:app()
-    equal(f.output.state.injection.applied,1); equal(f.observer.state.appliedCount,1)
-    assert(not f.output.state.valid and not f.observer.state.verification.overall)
+    equal(f.output.state.injection.applied,1); equal(f.observer.getState().appliedCount,1)
+    assert(not f.output.state.valid and not f.observer.getState().verification.overall)
 end)
 test('changing injection parameter cannot call physical API',function()
     local f=fixture(); f.bridge.params.injectionEnabled=true; f:ready()
@@ -235,7 +241,7 @@ end)
 test('Observer cannot overrule a failed validator',function()
     local f=fixture(); f:ready(); f.output.state.valid=false; f.output.state.status='TEST_BLOCKED'
     f.observer.update(0.2,f.car,f.runtime)
-    equal(f.observer.state.verification.overall,false); equal(f.observer.state.status,'TEST_BLOCKED')
+    equal(f.observer.getState().verification.overall,false); equal(f.observer.getState().status,'TEST_BLOCKED')
 end)
 test('source freshness is tied to module update times',function()
     local f=fixture(); f:step(); f.runtime.time=1
