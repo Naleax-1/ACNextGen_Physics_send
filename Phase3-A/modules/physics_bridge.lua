@@ -20,6 +20,8 @@ M.state = state
 local bus, pending, completedInput
 local lastSubmitted = 0
 local stopped = false
+local previousTime = nil
+local observedWorkerErrors = 0
 
 -- One layout definition is used in BOTH Lua contexts, avoiding ABI drift.
 -- Force channels retain their owner's semantics; no body sum is fabricated.
@@ -61,7 +63,7 @@ function script.update(dt)
         packet[name] = bridge['input_' .. name]
         valid = valid and finite(packet[name])
     end
-    if bridge.inputSequence ~= seq then return end
+    if bridge.inputSequence ~= seq or bridge.generation ~= generation then return end
     bridge.outputValid = 0
     for _, name in ipairs(fields) do bridge['output_' .. name] = packet[name] end
     bridge.outputTick = bridge.workerTicks
@@ -75,9 +77,10 @@ local function finite(v)
     return type(v) == 'number' and v == v and v ~= math.huge and v ~= -math.huge
 end
 local function fault(message)
-    state.errorCount = state.errorCount + 1
+    if state.workerError ~= tostring(message) then state.errorCount = state.errorCount + 1 end
     state.workerError = tostring(message)
     state.workerOutputValid = false
+    state.workerOutput.valid = false
 end
 local function detectAPI()
     state.apiAvailable = physics ~= nil and type(physics.startPhysicsWorker) == 'function'
@@ -92,7 +95,11 @@ local function createBus()
     local ok, result = pcall(function()
         return assert(loadstring(SHARED .. '\nreturn ac.connect(layout)'))()
     end)
-    if not ok then fault('connect: ' .. tostring(result)); return false end
+    if not ok or not result then
+        stopped = true
+        fault('connect: ' .. tostring(result or 'no shared bus returned'))
+        return false
+    end
     bus = result
     -- Persist generation in the shared connection across app reloads. Old
     -- workers observe the change and terminate rather than writing this run.
@@ -132,17 +139,21 @@ local function makePacket(output, now)
     end
     if not finite(output.timestamp) or output.timestamp > now
         or now - output.timestamp > M.params.heartbeatTimeout then return nil, 'stale/future source timestamp' end
+    if type(output.vehicle) ~= 'table' or type(output.wheel) ~= 'table'
+        or type(output.body) ~= 'table' or type(output.body.available) ~= 'boolean' then
+        return nil, 'invalid source contract shape'
+    end
     local p = { sequence = seq, timestamp = output.timestamp }
-    for _, name in ipairs(vehicleFields) do p[name] = output.vehicle and output.vehicle[name] end
+    for _, name in ipairs(vehicleFields) do p[name] = output.vehicle[name] end
     local body = output.body
-    p.bodyAvailable = body and body.available == true and 1 or 0
+    p.bodyAvailable = body.available and 1 or 0
     -- Unavailable is explicit metadata, NOT a generated zero-force result.
     for _, name in ipairs({'forceX', 'forceY', 'forceZ'}) do
-        p[name] = p.bodyAvailable == 1 and body[name] or 0
+        if p.bodyAvailable == 1 then p[name] = body[name] else p[name] = 0 end
     end
     for i = 0, 3 do
         local w = output.wheel and output.wheel[i]
-        if not w or w.available ~= true then return nil, 'wheel unavailable: ' .. i end
+        if type(w) ~= 'table' or w.available ~= true then return nil, 'wheel unavailable: ' .. i end
         for _, name in ipairs(wheelFields) do p[name .. i] = w[name] end
     end
     for _, name in ipairs(vehicleFields) do
@@ -236,6 +247,20 @@ function M.update(dt, car, runtime)
     bus.enabled = 0
     state.appliedCount = bus.appliedCount -- observe, never hide an unexpected write
     if not finite(now) then fault('runtime clock invalid'); return end
+    if previousTime and now < previousTime then fault('runtime clock regressed') end
+    previousTime = now
+    if bus.generation ~= state.workerGeneration then
+        stopped = true
+        fault('shared generation changed; reload required')
+    end
+    if bus.workerTicks < state.workerTicks then fault('worker tick regressed') end
+    if bus.workerErrors > observedWorkerErrors then
+        observedWorkerErrors = bus.workerErrors
+        fault('worker rejected input: ' .. observedWorkerErrors)
+    end
+    if pending and now - pending.timestamp > M.params.heartbeatTimeout and state.errorCount == 0 then
+        fault('worker response timeout: sequence ' .. pending.sequence)
+    end
     if bus.workerTicks > state.workerTicks then state.lastWorkerTickTime = now end
     state.workerTicks = bus.workerTicks
     state.workerAlive = not stopped and bus.workerTicks > 0
@@ -254,7 +279,7 @@ function M.update(dt, car, runtime)
         or state.staleTime > M.params.heartbeatTimeout
     state.workerInputValid = completedInput ~= nil and packet ~= nil
     state.workerOutputValid = state.workerOutput.available and state.workerInputValid
-        and state.workerAlive and not state.outputStale and state.errorCount == 0
+        and M.params.probeEnabled and state.workerAlive and not state.outputStale and state.errorCount == 0
         and bus.workerErrors == 0 and state.appliedCount == 0
     state.workerOutput.valid = state.workerOutputValid
     state.inputAvailable = completedInput ~= nil or pending ~= nil
