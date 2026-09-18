@@ -261,5 +261,124 @@ test('worker startup exception remains diagnostic',function()
     f:step(); assert(f.output.state.error_count>0); equal(f.output.state.valid,false)
 end)
 
+test('first response timeout is an error even before any accepted output',function()
+    local f=fixture(); f:step(); f.runtime.time=1; f:app()
+    assert(f.output.state.error_count>0 and not f.output.state.valid)
+    assert(f.output.state.failure:find('timeout'))
+end)
+test('worker-side numeric rejection is reported, not just a silent WAIT',function()
+    local f=fixture(); f:step(); f.shared.input_lateralForce0=0/0; f:worker(); f:app()
+    equal(f.shared.workerErrors,1); assert(f.output.state.error_count>0)
+    assert(f.output.state.failure:find('worker rejected input'))
+end)
+test('nil connection failure is contained and retained',function()
+    local f=fixture(); f.env.ac.connect=function() return nil end; f:step()
+    assert(f.output.state.error_count>0); equal(f.output.state.valid,false)
+    assert(f.output.state.failure:find('no shared bus'))
+end)
+test('available body with a missing component is not replaced with zero',function()
+    local f=fixture(); f:step()
+    f.hub.state.output.body={available=true,forceX=nil,forceY=0,forceZ=0}
+    f:worker(); f:app()
+    equal(f.bridge.state.sourceValid,false); equal(f.output.state.valid,false)
+    assert(f.bridge.state.inputFailure:find('invalid body'))
+end)
+test('declared body result roundtrips without altering components',function()
+    local f=fixture(); f.hub.state.output.body={available=true,forceX=12.5,forceY=-7,forceZ=4}
+    f:ready(); equal(f.output.state.body_available,true)
+    equal(f.output.state.values.forceX,12.5); equal(f.output.state.values.forceY,-7)
+end)
+test('malformed source shape is blocked without throwing',function()
+    local f=fixture(); f:step(); f.hub.state.output.vehicle=false; f:app()
+    equal(f.bridge.state.sourceValid,false); equal(f.output.state.valid,false)
+end)
+test('malformed returned wheel shape is blocked by validator',function()
+    local f=fixture(); f:ready(); f.bridge.state.workerOutput.wheel[0]=false; f:app()
+    assert(f.output.state.error_count>0); equal(f.output.state.values,nil)
+end)
+test('future timestamp in output is rejected',function()
+    local f=fixture(); f:step(); f:worker(); f.shared.output_timestamp=100; f:app()
+    assert(f.output.state.error_count>0); equal(f.output.state.valid,false)
+end)
+test('runtime clock rollback is an explicit error',function()
+    local f=fixture(); f:ready(); f.runtime.time=0; f:app()
+    assert(f.output.state.error_count>0 and not f.output.state.valid)
+end)
+test('source sequence rollback is rejected',function()
+    local f=fixture(); f:ready(); f.hub.state.output.sequence=1; f:app()
+    assert(f.output.state.error_count>0); assert(f.output.state.failure:find('regressed'))
+end)
+test('sequence overflow is blocked rather than wrapping',function()
+    local f=fixture(); f:step(); f.hub.state.output.sequence=2147483647; f:app()
+    equal(f.bridge.state.sourceValid,false); equal(f.output.state.valid,false)
+end)
+test('reload changes generation and terminates old worker',function()
+    local f=fixture(); f:ready(); local old=f.workers[1]; local generation=f.shared.generation
+    f.bridge=f:load('modules/physics_bridge.lua'); f.bridge.init(); f:app()
+    assert(f.shared.generation~=generation); old.update(1/333); equal(old.stopped,true)
+    equal(f.bridge.state.transferCount,0); equal(f.output.state.valid,false)
+end)
+test('fresh cached output without progression is not a new transport PASS',function()
+    local f=fixture(); f:ready(); f:app()
+    equal(f.output.state.valid,true); equal(f.output.state.transfer_delta,0)
+    equal(f.output.state.transport_pass,false); equal(f.observer.getState().verification.overall,false)
+end)
+test('runtime error removes usable snapshot as well as overall PASS',function()
+    local f=fixture(); f:ready(); f.runtime.totalErrorCount=1; f:app()
+    equal(f.output.state.values,nil); equal(f.output.state.worker_output_valid,false)
+end)
+
+-- Run the actual runtime scheduler and unchanged calculation modules, rather
+-- than supplying test force values. AC telemetry is still a test double.
+local function fullRuntime()
+    local f=fixture()
+    local cache={['modules.physics']=f.hub,['modules.physics_bridge']=f.bridge,
+        ['modules.worker_output']=f.output,['modules.observer']=f.observer}
+    f.env.require=function(name)
+        name=name:gsub('/', '.')
+        if not cache[name] then cache[name]=f:load(name:gsub('%.','/')..'.lua') end
+        return cache[name]
+    end
+    f:load('ACNextGen.lua')
+    f.cache=cache
+    function f:runFrames(count)
+        for _=1,count do self.env.update(1/60); self:worker(5) end
+    end
+    return f
+end
+test('full runtime: original calculations reach worker with exact wheel identity',function()
+    local f=fullRuntime(); local expected={}; local sawNonzero=false
+    for frame=1,240 do
+        if frame==120 then f.car.wheels[0].slipAngle=0.16 end
+        f.env.update(1/60)
+        local source=f.hub.state.output
+        if source.valid then
+            expected[source.sequence]={}
+            for i=0,3 do expected[source.sequence][i]=source.wheel[i].lateralForce end
+        end
+        local out=f.output.state.values
+        if out then
+            for i=0,3 do
+                equal(out.wheel[i].lateralForce,expected[out.sequence][i])
+                if out.wheel[i].lateralForce~=0 then sawNonzero=true end
+            end
+        end
+        f:worker(5)
+    end
+    assert(sawNonzero); assert(f.bridge.state.transferCount>100)
+    equal(f.output.state.error_count,0); equal(f.calls,0)
+end)
+test('full runtime: producer exceptions invalidate old state bus entries',function()
+    local f=fullRuntime(); f:runFrames(10); assert(f.output.state.valid)
+    f.cache['modules.tire_force'].update=function() error('test producer failure') end
+    f:runFrames(20)
+    assert(f.output.state.error_count>0); equal(f.hub.state.output.valid,false)
+    equal(f.output.state.values,nil); assert(f.output.state.failure:find('test producer failure'))
+end)
+test('full runtime: raw NaN telemetry cannot become valid default input',function()
+    local f=fullRuntime(); f:runFrames(10); f.car.rpm=0/0; f:runFrames(3)
+    equal(f.output.state.checks.vehicle_valid,false); equal(f.output.state.valid,false)
+end)
+
 print(string.format('\n%d tests, %d failures (offline mocks, NOT AC validation)',tests,failed))
 assert(failed==0, 'offline regression failures: '..failed)
