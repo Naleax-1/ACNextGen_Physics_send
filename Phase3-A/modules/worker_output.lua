@@ -4,7 +4,7 @@
 local M = { params = { staleTimeout = 0.75, expectedWheelCount = 4 } }
 local state = {
     schema = 'ACNextGen.WorkerOutput.v3', source = 'physics_worker',
-    available = false, valid = false, values = nil, tick = 0, timestamp = nil,
+    available = false, valid = false, transport_pass = false, values = nil, tick = 0, timestamp = nil,
     error_count = 0, failure = '', status = 'INIT',
     worker_alive = false, worker_input_valid = false, worker_output_valid = false,
     current_tick = 0, last_worker_tick = 0, last_valid_tick = 0,
@@ -42,10 +42,12 @@ local function validVehicle(runtime)
     return true
 end
 local function validPayload(out)
-    if not out or out.schema ~= state.schema or not out.available then return false end
+    if type(out) ~= 'table' or out.schema ~= state.schema or out.available ~= true then return false end
     if not finite(out.sequence) or out.sequence <= 0 or out.sequence % 1 ~= 0
-        or not finite(out.tick) or out.tick <= 0 or not finite(out.timestamp) then return false end
-    if not out.body or type(out.body.available) ~= 'boolean' then return false end
+        or not finite(out.tick) or out.tick <= 0 or out.tick % 1 ~= 0
+        or not finite(out.timestamp) then return false end
+    if type(out.body) ~= 'table' or type(out.body.available) ~= 'boolean'
+        or type(out.vehicle) ~= 'table' or type(out.wheel) ~= 'table' then return false end
     if out.body.available then
         for _, k in ipairs({'forceX', 'forceY', 'forceZ'}) do
             if not finite(out.body[k]) then return false end
@@ -56,7 +58,7 @@ local function validPayload(out)
     end
     for i = 0, 3 do
         local w = out.wheel and out.wheel[i]
-        if not w or w.available ~= true then return false end
+        if type(w) ~= 'table' or w.available ~= true then return false end
         for _, k in ipairs({'lateralForce', 'longitudinalForce', 'load', 'slipRatio', 'slipAngle', 'omega'}) do
             if not finite(w[k]) then return false end
         end
@@ -69,7 +71,7 @@ local function publish()
             'worker_input_valid', 'worker_output_valid', 'stale', 'stale_time',
             'current_tick', 'last_valid_tick', 'last_worker_tick', 'transfer_count',
             'transfer_delta', 'input_sequence', 'output_sequence', 'pending_sequence',
-            'status', 'failure', 'available', 'body_available'}) do
+            'status', 'failure', 'available', 'body_available', 'transport_pass'}) do
         local value = state[key]
         if type(value) == 'boolean' then value = value and 1 or 0 end
         pcall(ac.store, 'ngp_worker_' .. key, value)
@@ -88,6 +90,7 @@ function M.init() state.status = 'PHASE_3A_READY'; publish() end
 function M.update(dt, car, runtime)
     local b = runtime and (runtime.physicsBridge or (runtime.moduleStates or {}).physics_bridge)
     local out = b and b.workerOutput
+    if type(out) ~= 'table' then out = nil end
     local now = runtime and runtime.time
     local c = state.checks
     c.state_valid = finite(now) and finite(runtime.frame)
@@ -124,7 +127,7 @@ function M.update(dt, car, runtime)
     state.injection.enabled = b ~= nil and b.injectionEnabled == true
     state.injection.applied = b and b.appliedCount or 0
     c.injection_safe = b ~= nil and not state.injection.enabled and state.injection.applied == 0
-    state.body_available = state.available and out.body ~= nil and out.body.available == true
+    state.body_available = state.available and type(out.body) == 'table' and out.body.available == true
     state.input_force = b and b.bodyForce or {x=0, y=0, z=0}
     state.output_force = { x = out and out.forceX or 0, y = out and out.forceY or 0, z = out and out.forceZ or 0 }
     -- Startup WAIT is not an error. Real faults persist until app reload.
@@ -141,15 +144,16 @@ function M.update(dt, car, runtime)
     if runtime and (runtime.totalErrorCount or 0) > 0 then state.failure = runtime.lastError or 'runtime error' end
     state.worker_output_valid = state.available and out.valid == true
         and b.workerOutputValid == true and c.numeric_valid and c.sequence_valid
-        and not state.stale and c.injection_safe
+        and not state.stale and c.injection_safe and c.wheels_valid and state.error_count == 0
     state.valid = state.worker_output_valid and state.worker_input_valid
         and c.wheels_valid and state.error_count == 0 and state.transfer_count > 0
-    state.values = state.worker_output_valid and out or nil
+    state.values = state.valid and out or nil
+    state.transport_pass = state.valid and state.transfer_delta > 0
     state.tick = state.available and out.tick or 0
     if state.valid then
         state.last_valid_tick = state.tick
         -- Transport scope only: not full Phase 3-A, AC application or behavior.
-        state.status = 'PHASE_3A_TRANSPORT_PASS'
+        state.status = state.transport_pass and 'PHASE_3A_TRANSPORT_PASS' or 'PHASE_3A_TRANSPORT_FRESH'
     elseif state.error_count > 0 then state.status = 'PHASE_3A_ERROR'
     elseif not c.vehicle_valid or not c.wheels_valid then state.status = 'PHASE_3A_INPUT_INVALID'
     elseif not state.worker_alive then state.status = 'PHASE_3A_WORKER_WAIT'
