@@ -658,12 +658,12 @@ local function verify(runtime)
     v.tick = output ~= nil and output.tick_fresh == true
     v.input = output ~= nil and output.worker_input_valid == true
     v.output = output ~= nil and output.worker_output_valid == true
-    v.transfer = output ~= nil and output.transfer_count > 0
+    v.transfer = output ~= nil and output.transfer_delta > 0
     v.errors = output ~= nil and output.error_count == 0
     v.stale = output ~= nil and output.stale == false
     v.injection = checks.injection_safe == true
     v.applied = output ~= nil and output.injection.applied == 0
-    v.overall = output ~= nil and output.valid == true
+    v.overall = output ~= nil and output.valid == true and output.transport_pass == true
     state.status = output and output.status or "PHASE_3A_OUTPUT_WAIT"
     state.errorCount = output and output.error_count or 0
     state.lastError = output and output.failure or ""
