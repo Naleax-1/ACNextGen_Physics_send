@@ -175,7 +175,11 @@ M.debug = state
 -- downstream code can consume one stable shape without knowing module internals.
 state.output = {
     schema = "ACNextGen.PhysicsHub.v1",
+    available = false,
     valid = false,
+    sequence = 0,
+    timestamp = 0,
+    vehicle = {},
     source = "internal_state_bus",
     wheel = {
         [0] = { lateralForce = 0.0, longitudinalForce = 0.0, verticalForce = 0.0, wheelTorque = 0.0 },
@@ -843,8 +847,22 @@ local function readModules(runtime)
         -- Canonical output contract. Vertical force / wheel torque are not
         -- fabricated in Phase 2: availability stays false until a module
         -- explicitly owns those outputs.
-        state.output.wheel[i].lateralForce = state.forceLat[i]
-        state.output.wheel[i].longitudinalForce = state.forceLong[i]
+        local outWheel = state.output.wheel[i]
+        -- Strict zero-based state-bus contract: do not alias a missing wheel
+        -- to its neighbour, or turn a missing/NaN result into a valid zero.
+        local forceWheels = runtime and runtime.moduleWheelStates and runtime.moduleWheelStates.tire_force
+        local tireWheels = runtime and runtime.moduleWheelStates and runtime.moduleWheelStates.tire_state
+        local fw = forceWheels and forceWheels[i]
+        local tw = tireWheels and tireWheels[i]
+        outWheel.available = fw ~= nil and tw ~= nil
+        outWheel.lateralForce = fw and fw.lateral
+        outWheel.longitudinalForce = fw and fw.longitudinal
+        outWheel.load = tw and tw.load
+        outWheel.slipRatio = tw and tw.filteredSlipRatio
+        outWheel.slipAngle = tw and tw.filteredSlipAngle
+        outWheel.omega = tw and tw.omega
+        outWheel.verticalAvailable = false
+        outWheel.torqueAvailable = false
     end
 
     if mb then
@@ -907,6 +925,47 @@ local function readModules(runtime)
     -- above and is intentionally NOT allowed to overwrite direct state-bus data.
     state.output.valid = directCount >= 8
     state.output.source = directCount > 0 and "internal_state_bus" or "legacy_store_fallback"
+end
+
+-- Strict transport metadata, independent of the legacy diagnostic fallbacks.
+-- This validates/copies existing results; it does not create forces or moments.
+local function validateTransport(runtime, carOK)
+    local output = state.output
+    local function finite(v)
+        return type(v) == "number" and v == v and v ~= math.huge and v ~= -math.huge
+    end
+    output.available = runtime ~= nil and runtime.state ~= nil
+    output.valid = false
+    if not output.available then return end
+    output.sequence = runtime.frame
+    output.timestamp = runtime.time
+    if not carOK or not finite(runtime.time) or not finite(runtime.frame)
+        or runtime.frame <= 0 or runtime.frame % 1 ~= 0 then return end
+    local vehicle = runtime.state.vehicle
+    if not vehicle or vehicle.valid ~= true or vehicle.wheelsValid ~= true then return end
+    for _, key in ipairs({"speedKmh", "rpm", "steer", "gear", "brake", "gas"}) do
+        output.vehicle[key] = vehicle[key]
+        if not finite(vehicle[key]) then return end
+    end
+    -- Respect scheduled (30/60 Hz) producers, but never bless a frozen or
+    -- failed module merely because its old table is still in the bus.
+    for _, name in ipairs({"tire_state", "load_transfer", "mass_balance", "suspension",
+            "drivetrain", "diff_lsd", "tire_force", "yaw_moment_budget"}) do
+        local time = runtime.moduleUpdatedAt and runtime.moduleUpdatedAt[name]
+        if not runtimeModuleState(runtime, name) or not finite(time)
+            or time > runtime.time or runtime.time - time > 0.10 then return end
+    end
+    for _, err in pairs(runtime.moduleErrors or {}) do
+        if err ~= "" then return end
+    end
+    for i = 0, 3 do
+        local w = output.wheel[i]
+        if not w.available then return end
+        for _, key in ipairs({"lateralForce", "longitudinalForce", "load", "slipRatio", "slipAngle", "omega"}) do
+            if not finite(w[key]) then return end
+        end
+    end
+    output.valid = true
 end
 
 --============================================================
@@ -1099,6 +1158,7 @@ function M.update(dt, car, runtime)
     local carOK = readCar(car, dt)
 
     readModules(runtime)
+    validateTransport(runtime, carOK)
 
     if carOK then
         state.status = "RUNNING"
