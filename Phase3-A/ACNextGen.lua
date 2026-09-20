@@ -7,7 +7,7 @@
 --============================================================
 
 local APP_NAME = "ACNextGen"
-local VERSION  = "V1.1 Phase 3-A Complete / Worker Output Verification"
+local VERSION  = "V1.1 Phase 3-A / Result Transport Verification"
 
 local RUNTIME_STORE_INTERVAL = 0.25
 local PROFILE_EXPORT_INTERVAL = 2.00
@@ -43,6 +43,7 @@ local runtime = {
     -- directly and only falls back to ac.store/ac.load for legacy compatibility.
     moduleStates = {},
     moduleWheelStates = {},
+    moduleUpdatedAt = {},
     state = {
         vehicle = {
             valid = false,
@@ -419,6 +420,7 @@ local function loadModules()
     runtime.moduleErrors = {}
     runtime.moduleStates = {}
     runtime.moduleWheelStates = {}
+    runtime.moduleUpdatedAt = {}
     runtime.state.moduleStates = runtime.moduleStates
     runtime.state.moduleWheelStates = runtime.moduleWheelStates
     runtime.initialized = false
@@ -587,6 +589,8 @@ local function safeUpdate(entry, dt, car, profileNow)
         runtime.moduleErrors[entry.name] = ""
         entry.updateCount = (entry.updateCount or 0) + 1
 
+        runtime.moduleUpdatedAt[entry.name] = runtime.time
+
         -- Phase 2: canonical calculation-result handoff.
         -- getState() is treated as read-only by the hub; we keep the live table
         -- so no per-frame deep copy/GC storm is introduced.
@@ -609,22 +613,38 @@ local function safeUpdate(entry, dt, car, profileNow)
                             pcall(entry.module.getState, wheelIndex)
                         if wheelOK and wheelState ~= nil then
                             wheelStates[wheelIndex] = wheelState
+                        else
+                            wheelStates[wheelIndex] = nil
+                            setEntryStatus(entry, "ERROR", wheelState or ("getState missing wheel " .. wheelIndex))
                         end
                     end
                     runtime.moduleWheelStates[entry.name] = wheelStates
                 end
+            else
+                runtime.moduleStates[entry.name] = nil
+                runtime.moduleWheelStates[entry.name] = nil
+                setEntryStatus(entry, "ERROR", moduleState or "getState returned nil")
             end
         elseif entry.name == "physics" and type(entry.module.getState) == "function" then
             local hubOK, hubState = pcall(entry.module.getState)
             if hubOK and hubState then
                 runtime.moduleStates[entry.name] = hubState
                 runtime.physicsOutput = hubState.output
+            else
+                runtime.moduleStates[entry.name] = nil
+                runtime.physicsOutput = nil
+                setEntryStatus(entry, "ERROR", hubState or "physics getState returned nil")
             end
         end
 
         -- physics_bridge, worker_output and observer are sequenced explicitly
         -- below because their order is part of the Phase 3-A contract.
     else
+        -- Failed updates must not leave an old live table looking current.
+        runtime.moduleStates[entry.name] = nil
+        runtime.moduleWheelStates[entry.name] = nil
+        runtime.moduleUpdatedAt[entry.name] = nil
+        if entry.name == "physics" then runtime.physicsOutput = nil end
         setEntryStatus(entry, "ERROR", err)
     end
 end
@@ -752,6 +772,15 @@ function update(dt)
     vehicle.wheelsValid = runtime.wheelsOK
 
     if car then
+        -- Validate the original required fields before legacy display defaults.
+        -- This does not alter module formulas or their car input.
+        for _, field in ipairs({"speedKmh", "rpm", "gear", "steer", "gas", "brake"}) do
+            local ok, value = pcall(function() return car[field] end)
+            if not ok or type(value) ~= "number" or value ~= value
+                or value == math.huge or value == -math.huge then
+                vehicle.valid = false
+            end
+        end
         vehicle.speedKmh = num(car.speedKmh, 0.0)
         vehicle.speedMs = num(vehicle.speedKmh, 0.0) / 3.6
         vehicle.rpm = num(car.rpm, 0.0)
